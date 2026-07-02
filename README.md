@@ -35,11 +35,14 @@ points its `init_smp_state` event at the right one, so no setup is needed:
 
 ## Setup
 
-[`uv`](https://docs.astral.sh/uv/) is the canonical package manager; dependencies
-(including the pinned `mjlab` git rev) are locked in `uv.lock`.
+Use [conda](https://docs.conda.io/) (or [mamba](https://mamba.readthedocs.io/))
+to create the environment:
 
 ```bash
-uv sync
+conda create -n smp python=3.12
+conda install -n smp -c pytorch -c conda-forge pytorch numpy matplotlib wandb tyro scikit-learn ruff
+conda activate smp
+pip install "mjlab @ git+https://github.com/mujocolab/mjlab.git@731fa27"
 ```
 
 ## Pipeline
@@ -50,6 +53,13 @@ uv sync
 3. **RL** (PPO with the frozen prior as a guidance reward) — documented below.
 
 ---
+## pretrain
+```
+python scripts/compute_norm_stats.py --input-dir datasets/npz --output datasets/norm_stats.npz
+python scripts/pretrain.py --data-dir /path/npz_folder --norm-stats-file datasets/norm_stats.npz --name pretrain --no-use-wandb
+python scripts/generate_viz.py --ckpt-path logs/pretrain/pretrain/20260529_190236/checkpoint_01999.pt
+```
+
 
 ## RL
 
@@ -67,10 +77,10 @@ Four downstream tasks are registered with `mjlab.tasks.registry` (importing
 
 ```bash
 # Train (checkpoints land under logs/)
-uv run scripts/train.py Smp-Forward-G1 --env.scene.num-envs=4096
+python scripts/train.py Smp-Forward-G1 --env.scene.num-envs=4096
 
 # Play a trained policy from a W&B run
-uv run scripts/play.py Smp-Forward-G1 --wandb-run-path <org>/<project>/<run> --num-envs 4
+python scripts/play.py Smp-Forward-G1 --wandb-run-path <org>/<project>/<run> --num-envs 4
 ```
 
 Swap the task id for any of the four. Because the priors are shipped and already

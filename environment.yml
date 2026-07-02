@@ -1,0 +1,23 @@
+name: smp
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python>=3.10,<3.14
+  - pip
+  # Core numeric / ML
+  - pytorch<2.11.0
+  - numpy>=1.26
+  - scikit-learn>=1.6
+  # Plotting
+  - matplotlib>=3.9
+  # CLI
+  - tyro>=0.9
+  # Logging
+  - wandb>=0.19
+  # Dev
+  - ruff>=0.14.14
+  - pip:
+    - mjlab @ git+https://github.com/mujocolab/mjlab.git@731fa27
