@@ -82,7 +82,7 @@ class _SwiGLU(nn.Module):
     a, b = self.proj(x).chunk(2, dim=-1)
     return F.silu(a) * b
 
-
+# 这里前馈神经网络的激活层是SwiGLU
 class _FeedForward(nn.Module):
   def __init__(
     self,
@@ -117,19 +117,19 @@ class _DiTBlock(nn.Module):
     self.num_heads = num_heads
     self.head_dim = head_dim
     self.attn_dim = num_heads * head_dim
-
+    # 用于注意力前的归一化
     self.norm1 = nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=False)
     self.to_q = nn.Linear(dim, self.attn_dim, bias=False)
     self.to_k = nn.Linear(dim, self.attn_dim, bias=False)
     self.to_v = nn.Linear(dim, self.attn_dim, bias=False)
     self.to_out = nn.Linear(self.attn_dim, dim, bias=False)
     self.attn_dropout = nn.Dropout(dropout)
-
+    # 用于前馈网络层前的归一化
     self.norm2 = nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=False)
     self.ff = _FeedForward(dim, mult=4, dropout=dropout)
 
     self.scale_shift_table = nn.Parameter(torch.randn(1, 1, 6, dim) / dim**0.5)
-
+  # 这个是自注意力，输入只有x然后q和k和v分别去处理同一个输入
   def _attn(self, x: torch.Tensor) -> torch.Tensor:
     B, N, _ = x.shape
     h, d = self.num_heads, self.head_dim
@@ -138,20 +138,23 @@ class _DiTBlock(nn.Module):
     v = self.to_v(x).reshape(B, N, h, d).transpose(1, 2)
     out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
     out = out.transpose(1, 2).reshape(B, N, h * d)
+    # dropout层
     return self.attn_dropout(self.to_out(out))
-
+  # x是加了噪声的数据(B*K,W,F)，time_hidden_states是(B*K)的形状
   def forward(self, x: torch.Tensor, time_hidden_states: torch.Tensor) -> torch.Tensor:
     B = x.shape[0]
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
       self.scale_shift_table + time_hidden_states.reshape(B, 1, 6, -1)
     ).chunk(6, dim=-2)
-
+    # 归一化
     h = self.norm1(x)
     h = h * (1 + scale_msa.squeeze(-2)) + shift_msa.squeeze(-2)
+    # 残差注意力，这里是x+而不是h+
     x = x + gate_msa.squeeze(-2) * self._attn(h)
-
+    # 在归一化
     h = self.norm2(x)
     h = h * (1 + scale_mlp.squeeze(-2)) + shift_mlp.squeeze(-2)
+    # 依旧残差，然后经过前馈神经网络
     x = x + gate_mlp.squeeze(-2) * self.ff(h)
     return x
 
@@ -208,6 +211,7 @@ class DiffusionDenoiser(nn.Module):
     self.sequence_pos_encoder = _SinusoidalPositionalEmbedding(
       self.inner_dim, max_seq_length=max(window_size, 32)
     )
+    # 这个blocks是由多个_DiTBlock组成，在这里是输入依次经过num_layers个注意力层和前馈层
     self.blocks = nn.ModuleList(
       [
         _DiTBlock(
@@ -223,12 +227,17 @@ class DiffusionDenoiser(nn.Module):
     self.postprocess_conv = nn.Conv1d(feature_dim, feature_dim, 1, bias=False)
 
   def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    # 交换第一维度和第二维度，(10240,10,59)->(10240,59,10)
     h = x_t.transpose(1, 2)
+    # 经过preprocess_conv卷积后，相当于一个映射Linear(59,59)形状仍然是(10240,59,10)，然后+h也就是添加残差
     h = self.preprocess_conv(h) + h
+    # 然后在变回(10240, 10, 59)
     h = h.transpose(1, 2)
-
+    # 升维变成(10240, 10, 256)
     h = self.proj_in(h)
+    # 正弦位置编码得到一个(B, 1 ,6*256)
     time_hidden_states = self.adaln_single(t)
+    # 给这十帧注入位置编码
     h = self.sequence_pos_encoder(h)
 
     for block in self.blocks:

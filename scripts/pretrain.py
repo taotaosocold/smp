@@ -58,12 +58,19 @@ def _diffusion_loss(
   draw without the cost of exhausting all T timesteps.
   """
   B = x_0.shape[0]
+  # 每个窗口的噪声采样数
   K = num_noise_samples
   # (B, W, F) → (B*K, W, F)
+  # 把窗口复制K份，也就是同一个干净数据对应10个不同的(t, \varepsilon)组合，loss求平均后梯度方差更小
   x_0_exp = x_0[:, None].expand(B, K, *x_0.shape[1:]).reshape(B * K, *x_0.shape[1:])
+  # 随机采样10240个时间步，每个来自Uniform(0, 49)。不同数据点、不同K之间独立采样，保证梯度多样性
+  # 这个t的shape为(B*K)
   t = scheduler.sample_timesteps(B * K, x_0.device)
+  # 生成纯高斯分布的噪声10240个，即(10240, 10, 59)
   noise = torch.randn_like(x_0_exp)
+  # 给干净的数据添加不同强度的噪声
   x_t = scheduler.add_noise(x_0_exp, noise, t)
+  # 模型预测的噪声和实际噪声做L1损失
   return F.l1_loss(model(x_t, t), noise)
 
 
@@ -100,30 +107,34 @@ def pretrain(cfg: PretrainCfg) -> Path:
   seed_everything(cfg.seed)
   print(f"[INFO] seed={cfg.seed}")
   device = torch.device(cfg.device)
-
+  # 这个dataset有__getitem__(idx)函数，每次去拜访索引后获得的是(window_size, feature_dim)的归一化后的数据
+  # 里面也含有反归一化的函数
   dataset = MotionWindowDataset(cfg.data_dir, norm_stats_file=cfg.norm_stats_file)
   feature_dim = dataset.feature_dim
   window_size = dataset.window_size
-
+  # n_train 和 n_val 是用来划分训练集和验证集的样本数量
   n_train = int(len(dataset) * cfg.train_split)
   n_val = len(dataset) - n_train
   print(
     f"Dataset: {len(dataset)} windows, n_train={n_train}, n_val={n_val}, "
     f"feature_dim={feature_dim}, window_size={window_size}"
   )
-
+  # 把原始的 MotionWindowDataset 按 [n_train, n_val] 的长度随机切分成两个新的 Subset 对象
   train_set, val_set = random_split(dataset, [n_train, n_val])
   pin_memory = device.type == "cuda"
+  # 为训练集创建一个数据加载器， batch_size: 每个批次返回多少个窗口
+  # shuffle=True: 每个 epoch 都会随机打乱训练样本的顺序，这是训练的标准做法，防止模型记忆数据顺序
   train_loader = DataLoader(
     train_set,
     batch_size=cfg.batch_size,
     shuffle=True,
     pin_memory=pin_memory,
   )
+  # 测试集同理
   val_loader = DataLoader(
     val_set, batch_size=cfg.batch_size, shuffle=False, pin_memory=pin_memory
   )
-
+  # 获得扩散模型
   model = DiffusionDenoiser(
     feature_dim=feature_dim,
     window_size=window_size,
@@ -132,15 +143,16 @@ def pretrain(cfg: PretrainCfg) -> Path:
     num_layers=cfg.num_layers,
     dropout=cfg.dropout,
   ).to(device)
+  # DDPM 噪声调度器，其实就是设置了那个噪声的步数以及每一个等级的噪声强度
   scheduler = DDPMScheduler(
     num_timesteps=cfg.num_timesteps,
   ).to(device)
   print(f"Denoiser: {count_parameters(model):,} params")
-
+  # 优化器
   optimizer = torch.optim.AdamW(
     model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
   )
-
+  # 如果启用了 EMA（cfg.use_ema=True），会创建一个 _Ema 实例，维护模型参数的影子副本
   ema = _Ema(model, decay=cfg.ema_decay) if cfg.use_ema else None
   if ema is not None:
     print(f"EMA enabled (decay={cfg.ema_decay})")
@@ -154,16 +166,18 @@ def pretrain(cfg: PretrainCfg) -> Path:
     import wandb
 
     wandb_run = wandb.init(project=cfg.wandb_project, name=cfg.name, config=vars(cfg))
-
+  # 开始训练
   for epoch in range(cfg.num_epochs):
     model.train()
     epoch_loss = torch.zeros((), device=device)
     n_batches = 0
-
+    # 每一次获得一个批次的训练集。形状为（B，10，59）10是帧数，59是观测维度，B是批次默认为1024
     for batch in train_loader:
+      # 干净的数据转换到gpu上
       x_0 = batch.to(device, non_blocking=pin_memory)
+      # 经过扩散模型获得损失
       loss = _diffusion_loss(model, scheduler, x_0, cfg.num_noise_samples)
-
+      # 反向传播
       optimizer.zero_grad()
       loss.backward()
       if cfg.max_grad_norm > 0:

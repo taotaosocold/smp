@@ -21,6 +21,7 @@ class MotionWindowDataset(Dataset[torch.Tensor]):
     data_dir: str | Path,
     norm_stats_file: str | Path | None = None,
   ) -> None:
+    # 获得所有npz文件
     npz_files = sorted(Path(data_dir).glob("*.npz"))
     if not npz_files:
       msg = f"No NPZ files found in {data_dir}"
@@ -66,10 +67,11 @@ class MotionWindowDataset(Dataset[torch.Tensor]):
         self.q_high[tiny] = self.q_low[tiny] + 1.0
 
     # Normalize
+    # 将所有数据归一化
     data = 2.0 * (data - self.q_low) / (self.q_high - self.q_low) - 1.0
 
     self.windows = torch.from_numpy(data)
-
+  # 将数据反归一化
   def denormalize(self, x: torch.Tensor) -> torch.Tensor:
     q_low = torch.from_numpy(self.q_low).to(x.device, x.dtype)
     q_high = torch.from_numpy(self.q_high).to(x.device, x.dtype)
