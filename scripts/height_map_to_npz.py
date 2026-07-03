@@ -199,7 +199,14 @@ def main(cfg: Cfg) -> None:
         ee_pos_list = [data["body_pos_w"][:, idx, :].astype(np.float32) for idx in EE_IDXS]
         ee_pos = torch.from_numpy(np.stack(ee_pos_list, axis=1)).to(device)  # (T, E, 3)
 
-        joint_pos = torch.from_numpy(data["joint_pos"].astype(np.float32)).to(device)
+        # TCRS joint order groups by type (pitch→roll→yaw), but the model
+        # expects G1 standard order grouped by limb (left leg→right leg→
+        # waist→left arm→right arm).  Reorder to match csv_to_npz.py output.
+        _TCRS_TO_G1 = [
+          0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18, 2, 5, 8, 11,
+          15, 19, 21, 23, 25, 27, 12, 16, 20, 22, 24, 26, 28,
+        ]
+        joint_pos = torch.from_numpy(data["joint_pos"].astype(np.float32)[:, _TCRS_TO_G1]).to(device)
 
         height_map = torch.from_numpy(data["height_map"].astype(np.float32)).to(device)
 
