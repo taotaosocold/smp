@@ -1,4 +1,9 @@
-"""DiT-style ε-prediction denoiser for motion windows."""
+"""DiT-style ε-prediction denoiser for motion windows (optionally terrain-conditioned).
+
+Terrain conditioning uses per-frame spatial encoding (Conv2D over the height-map
+grid) followed by cross-attention in each DiT block, so every motion frame can
+attend to its corresponding terrain context.
+"""
 
 from __future__ import annotations
 
@@ -8,9 +13,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# ── Grid dimensions of the height map ──
+GRID_X = 17
+GRID_Y = 11
+
 
 class _Timesteps(nn.Module):
-  """Sinusoidal timestep features, ``flip_sin_to_cos`` (cos first, sin second)."""
+  """Sinusoidal timestep features, cos first, sin second."""
 
   def __init__(self, num_channels: int = 256) -> None:
     super().__init__()
@@ -40,35 +49,35 @@ class _TimestepEmbedding(nn.Module):
     return self.linear_2(self.act(self.linear_1(x)))
 
 
-class _TerrainEncoder(nn.Module):
-  """Encode windowed height-map into a conditioning embedding.
+class _SpatialTerrainEncoder(nn.Module):
+  """Per-frame 2D Conv encoder for height maps.
 
-  Per-frame encoding → temporal pool → embed_dim projection.
-  Input ``(B, W, T_dim)`` → output ``(B, embed_dim)``.
+  Input ``(B, W, 187)`` where 187 = 17×11, output ``(B, W, embed_dim)``.
+  Each frame's height map is treated as a 1-channel 17×11 image so the
+  encoder preserves the spatial structure (e.g. "higher on the left").
   """
 
-  def __init__(self, terrain_per_frame_dim: int, window_size: int, embed_dim: int) -> None:
+  def __init__(self, embed_dim: int) -> None:
     super().__init__()
-    self.window_size = window_size
-    self.per_frame = nn.Sequential(
-      nn.Linear(terrain_per_frame_dim, embed_dim // 2),
+    self.conv = nn.Sequential(
+      nn.Conv2d(1, 32, 3, padding=1),   # 17×11 → 17×11×32
+      nn.SiLU(),
+      nn.Conv2d(32, 64, 3, padding=1),  # 17×11×64
       nn.SiLU(),
     )
-    self.proj = nn.Linear(window_size * (embed_dim // 2), embed_dim)
+    self.pool = nn.AdaptiveAvgPool2d((4, 4))  # → 4×4×64 = 1024
+    self.proj = nn.Linear(1024, embed_dim)
 
   def forward(self, terrain: torch.Tensor) -> torch.Tensor:
-    B, W, T_dim = terrain.shape
-    h = self.per_frame(terrain)  # (B, W, D//2)
-    return self.proj(h.reshape(B, W * h.shape[-1]))  # (B, D)
+    B, W, _ = terrain.shape
+    h = terrain.reshape(B * W, 1, GRID_X, GRID_Y)  # (B·W, 1, 17, 11)
+    h = self.pool(self.conv(h))                     # (B·W, 64, 4, 4)
+    h = self.proj(h.flatten(1))                     # (B·W, embed_dim)
+    return h.reshape(B, W, -1)                      # (B, W, embed_dim)
 
 
 class _AdaLayerNormSingle(nn.Module):
-  """PixArt-α adaLN-single: produce (B, 1, 6·D) timestep + terrain modulation.
-
-  If ``terrain_emb`` is passed, it is added to the time embedding before the
-  final modulation projection so terrain context scales and shifts each
-  DiTBlock the same way the timestep does.
-  """
+  """PixArt-α adaLN-single: produce (B, 1, 6·D) timestep modulation."""
 
   def __init__(self, embedding_dim: int) -> None:
     super().__init__()
@@ -77,11 +86,8 @@ class _AdaLayerNormSingle(nn.Module):
     self.silu = nn.SiLU()
     self.linear = nn.Linear(embedding_dim, 6 * embedding_dim, bias=True)
 
-  def forward(self, t: torch.Tensor, terrain_emb: torch.Tensor | None = None) -> torch.Tensor:
-    t_emb = self.timestep_embedder(self.time_proj(t))  # (B, D)
-    if terrain_emb is not None:
-      t_emb = t_emb + terrain_emb
-    t_emb = t_emb.unsqueeze(1)  # (B, 1, D)
+  def forward(self, t: torch.Tensor) -> torch.Tensor:
+    t_emb = self.timestep_embedder(self.time_proj(t)).unsqueeze(1)
     return self.linear(self.silu(t_emb))
 
 
@@ -132,7 +138,7 @@ class _FeedForward(nn.Module):
 
 
 class _DiTBlock(nn.Module):
-  """Self-attention + SwiGLU FFN, both modulated by adaLN-single."""
+  """Self-attn → cross-attn (optional) → SwiGLU FFN, all modulated by adaLN."""
 
   def __init__(
     self,
@@ -148,6 +154,7 @@ class _DiTBlock(nn.Module):
     self.head_dim = head_dim
     self.attn_dim = num_heads * head_dim
 
+    # --- Self-attention ---
     self.norm1 = nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=False)
     self.to_q = nn.Linear(dim, self.attn_dim, bias=False)
     self.to_k = nn.Linear(dim, self.attn_dim, bias=False)
@@ -155,6 +162,15 @@ class _DiTBlock(nn.Module):
     self.to_out = nn.Linear(self.attn_dim, dim, bias=False)
     self.attn_dropout = nn.Dropout(dropout)
 
+    # --- Cross-attention (motion → terrain) ---
+    self.norm_cross = nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=False)
+    self.to_q_cross = nn.Linear(dim, self.attn_dim, bias=False)
+    self.to_k_cross = nn.Linear(dim, self.attn_dim, bias=False)
+    self.to_v_cross = nn.Linear(dim, self.attn_dim, bias=False)
+    self.to_out_cross = nn.Linear(self.attn_dim, dim, bias=False)
+    self.gate_cross = nn.Parameter(torch.zeros(1, 1, 1))
+
+    # --- FFN ---
     self.norm2 = nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=False)
     self.ff = _FeedForward(dim, mult=4, dropout=dropout)
 
@@ -170,19 +186,44 @@ class _DiTBlock(nn.Module):
     out = out.transpose(1, 2).reshape(B, N, h * d)
     return self.attn_dropout(self.to_out(out))
 
-  def forward(self, x: torch.Tensor, time_hidden_states: torch.Tensor) -> torch.Tensor:
+  def _cross_attn(
+    self, x: torch.Tensor, terrain_tokens: torch.Tensor
+  ) -> torch.Tensor:
+    B, N, _ = x.shape
+    h, d = self.num_heads, self.head_dim
+    q = self.to_q_cross(x).reshape(B, N, h, d).transpose(1, 2)
+    k = self.to_k_cross(terrain_tokens).reshape(B, N, h, d).transpose(1, 2)
+    v = self.to_v_cross(terrain_tokens).reshape(B, N, h, d).transpose(1, 2)
+    out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+    out = out.transpose(1, 2).reshape(B, N, h * d)
+    return self.to_out_cross(out)
+
+  def forward(
+    self,
+    x: torch.Tensor,
+    time_hidden_states: torch.Tensor,
+    terrain_tokens: torch.Tensor | None = None,
+  ) -> torch.Tensor:
     B = x.shape[0]
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
       self.scale_shift_table + time_hidden_states.reshape(B, 1, 6, -1)
     ).chunk(6, dim=-2)
 
+    # Self-attention
     h = self.norm1(x)
     h = h * (1 + scale_msa.squeeze(-2)) + shift_msa.squeeze(-2)
     x = x + gate_msa.squeeze(-2) * self._attn(h)
 
+    # Cross-attention (motion queries terrain)
+    if terrain_tokens is not None:
+      h_cross = self.norm_cross(x)
+      x = x + self.gate_cross * self._cross_attn(h_cross, terrain_tokens)
+
+    # FFN
     h = self.norm2(x)
     h = h * (1 + scale_mlp.squeeze(-2)) + shift_mlp.squeeze(-2)
     x = x + gate_mlp.squeeze(-2) * self.ff(h)
+
     return x
 
 
@@ -190,11 +231,9 @@ class DiffusionDenoiser(nn.Module):
   """ε-prediction DiT for motion windows (optionally terrain-conditioned).
 
   Pipeline: 1×1 Conv1d (channel mix, residual) → linear-in → adaLN-single
-  timestep (+ optional terrain) → additive sinusoidal positional encoding →
-  ``num_layers`` DiT blocks → linear-out → 1×1 Conv1d (residual).
-
-  ``d_model`` is the DiT inner dim; ``head_dim`` defaults to ``d_model //
-  nhead``.  FF inner dim is fixed at 4·d_model.
+  timestep → additive sin-cos PE → ``num_layers`` DiT blocks (each with
+  optional cross-attention to terrain tokens) → linear-out → 1×1 Conv1d
+  (residual).
 
   Input:  ``x_t (B, W, feature_dim)``, ``t (B,)`` long timesteps,
           ``terrain (B, W, terrain_dim)`` optional
@@ -238,7 +277,7 @@ class DiffusionDenoiser(nn.Module):
     self.proj_in = nn.Linear(feature_dim, self.inner_dim, bias=False)
 
     if terrain_dim is not None:
-      self.terrain_encoder = _TerrainEncoder(terrain_dim, window_size, self.inner_dim)
+      self.terrain_encoder = _SpatialTerrainEncoder(self.inner_dim)
     else:
       self.terrain_encoder = None
 
@@ -260,22 +299,27 @@ class DiffusionDenoiser(nn.Module):
     self.proj_out = nn.Linear(self.inner_dim, feature_dim, bias=False)
     self.postprocess_conv = nn.Conv1d(feature_dim, feature_dim, 1, bias=False)
 
-  def forward(self, x_t: torch.Tensor, t: torch.Tensor, terrain: torch.Tensor | None = None) -> torch.Tensor:
+  def forward(
+    self,
+    x_t: torch.Tensor,
+    t: torch.Tensor,
+    terrain: torch.Tensor | None = None,
+  ) -> torch.Tensor:
     h = x_t.transpose(1, 2)
     h = self.preprocess_conv(h) + h
     h = h.transpose(1, 2)
 
     h = self.proj_in(h)
 
-    terrain_emb = None
+    terrain_tokens = None
     if terrain is not None and self.terrain_encoder is not None:
-      terrain_emb = self.terrain_encoder(terrain)
+      terrain_tokens = self.terrain_encoder(terrain)  # (B, W, 256)
 
-    time_hidden_states = self.adaln_single(t, terrain_emb)
+    time_hidden_states = self.adaln_single(t)
     h = self.sequence_pos_encoder(h)
 
     for block in self.blocks:
-      h = block(h, time_hidden_states)
+      h = block(h, time_hidden_states, terrain_tokens=terrain_tokens)
 
     h = self.proj_out(h)
     h = h.transpose(1, 2)
