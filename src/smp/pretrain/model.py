@@ -1,8 +1,8 @@
 """DiT-style ε-prediction denoiser for motion windows (optionally terrain-conditioned).
 
-Terrain conditioning uses per-frame spatial encoding (Conv2D over the height-map
-grid) followed by cross-attention in each DiT block, so every motion frame can
-attend to its corresponding terrain context.
+Terrain conditioning uses input concatenation: terrain is projected to a smaller
+embedding and stacked with motion features before the DiT backbone.  No separate
+encoder or cross-attention — the backbone itself learns the joint distribution.
 """
 
 from __future__ import annotations
@@ -12,10 +12,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# ── Grid dimensions of the height map ──
-GRID_X = 17
-GRID_Y = 11
 
 
 class _Timesteps(nn.Module):
@@ -47,33 +43,6 @@ class _TimestepEmbedding(nn.Module):
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     return self.linear_2(self.act(self.linear_1(x)))
-
-
-class _SpatialTerrainEncoder(nn.Module):
-  """Per-frame 2D Conv encoder for height maps.
-
-  Input ``(B, W, 187)`` where 187 = 17×11, output ``(B, W, embed_dim)``.
-  Each frame's height map is treated as a 1-channel 17×11 image so the
-  encoder preserves the spatial structure (e.g. "higher on the left").
-  """
-
-  def __init__(self, embed_dim: int) -> None:
-    super().__init__()
-    self.conv = nn.Sequential(
-      nn.Conv2d(1, 32, 3, padding=1),   # 17×11 → 17×11×32
-      nn.SiLU(),
-      nn.Conv2d(32, 64, 3, padding=1),  # 17×11×64
-      nn.SiLU(),
-    )
-    self.pool = nn.AdaptiveAvgPool2d((4, 4))  # → 4×4×64 = 1024
-    self.proj = nn.Linear(1024, embed_dim)
-
-  def forward(self, terrain: torch.Tensor) -> torch.Tensor:
-    B, W, _ = terrain.shape
-    h = terrain.reshape(B * W, 1, GRID_X, GRID_Y)  # (B·W, 1, 17, 11)
-    h = self.pool(self.conv(h))                     # (B·W, 64, 4, 4)
-    h = self.proj(h.flatten(1))                     # (B·W, embed_dim)
-    return h.reshape(B, W, -1)                      # (B, W, embed_dim)
 
 
 class _AdaLayerNormSingle(nn.Module):
@@ -138,7 +107,7 @@ class _FeedForward(nn.Module):
 
 
 class _DiTBlock(nn.Module):
-  """Self-attn → cross-attn (optional) → SwiGLU FFN, all modulated by adaLN."""
+  """Self-attention → SwiGLU FFN, all modulated by adaLN."""
 
   def __init__(
     self,
@@ -154,7 +123,6 @@ class _DiTBlock(nn.Module):
     self.head_dim = head_dim
     self.attn_dim = num_heads * head_dim
 
-    # --- Self-attention ---
     self.norm1 = nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=False)
     self.to_q = nn.Linear(dim, self.attn_dim, bias=False)
     self.to_k = nn.Linear(dim, self.attn_dim, bias=False)
@@ -162,15 +130,6 @@ class _DiTBlock(nn.Module):
     self.to_out = nn.Linear(self.attn_dim, dim, bias=False)
     self.attn_dropout = nn.Dropout(dropout)
 
-    # --- Cross-attention (motion → terrain) ---
-    self.norm_cross = nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=False)
-    self.to_q_cross = nn.Linear(dim, self.attn_dim, bias=False)
-    self.to_k_cross = nn.Linear(dim, self.attn_dim, bias=False)
-    self.to_v_cross = nn.Linear(dim, self.attn_dim, bias=False)
-    self.to_out_cross = nn.Linear(self.attn_dim, dim, bias=False)
-    self.gate_cross = nn.Parameter(torch.zeros(1, 1, 1))
-
-    # --- FFN ---
     self.norm2 = nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=False)
     self.ff = _FeedForward(dim, mult=4, dropout=dropout)
 
@@ -186,40 +145,16 @@ class _DiTBlock(nn.Module):
     out = out.transpose(1, 2).reshape(B, N, h * d)
     return self.attn_dropout(self.to_out(out))
 
-  def _cross_attn(
-    self, x: torch.Tensor, terrain_tokens: torch.Tensor
-  ) -> torch.Tensor:
-    B, N, _ = x.shape
-    h, d = self.num_heads, self.head_dim
-    q = self.to_q_cross(x).reshape(B, N, h, d).transpose(1, 2)
-    k = self.to_k_cross(terrain_tokens).reshape(B, N, h, d).transpose(1, 2)
-    v = self.to_v_cross(terrain_tokens).reshape(B, N, h, d).transpose(1, 2)
-    out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-    out = out.transpose(1, 2).reshape(B, N, h * d)
-    return self.to_out_cross(out)
-
-  def forward(
-    self,
-    x: torch.Tensor,
-    time_hidden_states: torch.Tensor,
-    terrain_tokens: torch.Tensor | None = None,
-  ) -> torch.Tensor:
+  def forward(self, x: torch.Tensor, time_hidden_states: torch.Tensor) -> torch.Tensor:
     B = x.shape[0]
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
       self.scale_shift_table + time_hidden_states.reshape(B, 1, 6, -1)
     ).chunk(6, dim=-2)
 
-    # Self-attention
     h = self.norm1(x)
     h = h * (1 + scale_msa.squeeze(-2)) + shift_msa.squeeze(-2)
     x = x + gate_msa.squeeze(-2) * self._attn(h)
 
-    # Cross-attention (motion queries terrain)
-    if terrain_tokens is not None:
-      h_cross = self.norm_cross(x)
-      x = x + self.gate_cross * self._cross_attn(h_cross, terrain_tokens)
-
-    # FFN
     h = self.norm2(x)
     h = h * (1 + scale_mlp.squeeze(-2)) + shift_mlp.squeeze(-2)
     x = x + gate_mlp.squeeze(-2) * self.ff(h)
@@ -230,10 +165,10 @@ class _DiTBlock(nn.Module):
 class DiffusionDenoiser(nn.Module):
   """ε-prediction DiT for motion windows (optionally terrain-conditioned).
 
-  Pipeline: 1×1 Conv1d (channel mix, residual) → linear-in → adaLN-single
-  timestep → additive sin-cos PE → ``num_layers`` DiT blocks (each with
-  optional cross-attention to terrain tokens) → linear-out → 1×1 Conv1d
-  (residual).
+  Terrain conditioning uses input concatenation: raw height map → Linear
+  projection → concatenate with x_t → 1×1 Conv1d mix → Linear-in → DiT
+  backbone.  The architecture is otherwise identical to the unconditional
+  version.
 
   Input:  ``x_t (B, W, feature_dim)``, ``t (B,)`` long timesteps,
           ``terrain (B, W, terrain_dim)`` optional
@@ -250,10 +185,12 @@ class DiffusionDenoiser(nn.Module):
     dropout: float = 0.0,
     head_dim: int | None = None,
     terrain_dim: int | None = None,
+    terrain_proj_dim: int = 64,
   ) -> None:
     super().__init__()
     self.feature_dim = feature_dim
     self.window_size = window_size
+    self.terrain_dim = terrain_dim
 
     if head_dim is None:
       if d_model % nhead != 0:
@@ -273,13 +210,16 @@ class DiffusionDenoiser(nn.Module):
       )
       raise ValueError(msg)
 
-    self.preprocess_conv = nn.Conv1d(feature_dim, feature_dim, 1, bias=False)
-    self.proj_in = nn.Linear(feature_dim, self.inner_dim, bias=False)
-
+    # Terrain projection (optional)
     if terrain_dim is not None:
-      self.terrain_encoder = _SpatialTerrainEncoder(self.inner_dim)
+      self.terrain_proj = nn.Linear(terrain_dim, terrain_proj_dim, bias=False)
+      input_dim = feature_dim + terrain_proj_dim
     else:
-      self.terrain_encoder = None
+      self.terrain_proj = None
+      input_dim = feature_dim
+
+    self.preprocess_conv = nn.Conv1d(input_dim, input_dim, 1, bias=False)
+    self.proj_in = nn.Linear(input_dim, self.inner_dim, bias=False)
 
     self.adaln_single = _AdaLayerNormSingle(self.inner_dim)
     self.sequence_pos_encoder = _SinusoidalPositionalEmbedding(
@@ -305,21 +245,23 @@ class DiffusionDenoiser(nn.Module):
     t: torch.Tensor,
     terrain: torch.Tensor | None = None,
   ) -> torch.Tensor:
-    h = x_t.transpose(1, 2)
+    if terrain is not None and self.terrain_proj is not None:
+      terrain_emb = self.terrain_proj(terrain)           # (B, W, P)
+      h = torch.cat([x_t, terrain_emb], dim=-1)          # (B, W, F+P)
+    else:
+      h = x_t
+
+    h = h.transpose(1, 2)
     h = self.preprocess_conv(h) + h
     h = h.transpose(1, 2)
 
     h = self.proj_in(h)
 
-    terrain_tokens = None
-    if terrain is not None and self.terrain_encoder is not None:
-      terrain_tokens = self.terrain_encoder(terrain)  # (B, W, 256)
-
     time_hidden_states = self.adaln_single(t)
     h = self.sequence_pos_encoder(h)
 
     for block in self.blocks:
-      h = block(h, time_hidden_states, terrain_tokens=terrain_tokens)
+      h = block(h, time_hidden_states)
 
     h = self.proj_out(h)
     h = h.transpose(1, 2)
