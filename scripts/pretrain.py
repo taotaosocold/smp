@@ -1,4 +1,9 @@
-"""Diffusion model pretraining loop."""
+"""Diffusion model pretraining loop (unconditional or terrain-conditioned).
+
+When ``--terrain-data-dir`` is given, uses ``ConditionalMotionDataset`` and
+automatically builds a terrain-conditioned denoiser.  Otherwise falls back to
+the original unconditional path.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +17,7 @@ import torch.nn.functional as F
 import tyro
 from torch.utils.data import DataLoader, random_split
 
-from smp.pretrain.dataset import MotionWindowDataset
+from smp.pretrain.dataset import ConditionalMotionDataset, MotionWindowDataset
 from smp.pretrain.model import DiffusionDenoiser
 from smp.pretrain.pretrain_cfg import PretrainCfg
 from smp.pretrain.scheduler import DDPMScheduler
@@ -50,6 +55,7 @@ def _diffusion_loss(
   scheduler: DDPMScheduler,
   x_0: torch.Tensor,
   num_noise_samples: int,
+  terrain: torch.Tensor | None = None,
 ) -> torch.Tensor:
   """DDPM ε-prediction L1 loss with multiple noise samples per data point.
 
@@ -64,14 +70,20 @@ def _diffusion_loss(
   t = scheduler.sample_timesteps(B * K, x_0.device)
   noise = torch.randn_like(x_0_exp)
   x_t = scheduler.add_noise(x_0_exp, noise, t)
-  return F.l1_loss(model(x_t, t), noise)
+
+  if terrain is not None:
+    terrain_exp = terrain[:, None].expand(B, K, *terrain.shape[1:]).reshape(B * K, *terrain.shape[1:])
+  else:
+    terrain_exp = None
+
+  return F.l1_loss(model(x_t, t, terrain=terrain_exp), noise)
 
 
 def _save_checkpoint(
   path: Path,
   epoch: int,
   model: DiffusionDenoiser,
-  dataset: MotionWindowDataset,
+  dataset: MotionWindowDataset | ConditionalMotionDataset,
   feature_dim: int,
   cfg: PretrainCfg,
   optimizer: torch.optim.Optimizer | None = None,
@@ -88,6 +100,10 @@ def _save_checkpoint(
       "window_size": dataset.window_size,
     },
   }
+  if hasattr(dataset, "has_terrain") and dataset.has_terrain:
+    data["t_q_low"] = dataset.t_q_low          # type: ignore[attr-defined]
+    data["t_q_high"] = dataset.t_q_high         # type: ignore[attr-defined]
+    data["cfg"]["terrain_dim"] = dataset.terrain_dim  # type: ignore[attr-defined]
   if optimizer is not None:
     data["optimizer"] = optimizer.state_dict()
   if ema is not None:
@@ -101,15 +117,39 @@ def pretrain(cfg: PretrainCfg) -> Path:
   print(f"[INFO] seed={cfg.seed}")
   device = torch.device(cfg.device)
 
-  dataset = MotionWindowDataset(cfg.data_dir, norm_stats_file=cfg.norm_stats_file)
+  # ── Dataset (auto-detect conditional vs unconditional) ──
+  data_dir = cfg.data_dir
+  probe_files = sorted(Path(data_dir).glob("*.npz"))
+  if not probe_files:
+    raise FileNotFoundError(f"No NPZ files found in {data_dir}")
+
+  import numpy as _np
+  _probe = _np.load(str(probe_files[0]), allow_pickle=False)
+  is_conditional = "terrain" in _probe or "motion_windows" in _probe
+
+  if is_conditional:
+    print("[INFO] Detected terrain-conditioned data, using ConditionalMotionDataset")
+    tnorm = cfg.terrain_norm_stats_file or None
+    dataset = ConditionalMotionDataset(
+      data_dir,
+      norm_stats_file=cfg.norm_stats_file if cfg.norm_stats_file else None,
+      terrain_norm_stats_file=tnorm,
+    )
+    terrain_dim = dataset.terrain_dim
+  else:
+    print("[INFO] Using unconditional MotionWindowDataset")
+    dataset = MotionWindowDataset(data_dir, norm_stats_file=cfg.norm_stats_file)
+    terrain_dim = None
+
   feature_dim = dataset.feature_dim
   window_size = dataset.window_size
 
   n_train = int(len(dataset) * cfg.train_split)
   n_val = len(dataset) - n_train
+  extra = f", terrain_dim={terrain_dim}" if terrain_dim else ""
   print(
     f"Dataset: {len(dataset)} windows, n_train={n_train}, n_val={n_val}, "
-    f"feature_dim={feature_dim}, window_size={window_size}"
+    f"feature_dim={feature_dim}, window_size={window_size}{extra}"
   )
 
   train_set, val_set = random_split(dataset, [n_train, n_val])
@@ -131,11 +171,15 @@ def pretrain(cfg: PretrainCfg) -> Path:
     nhead=cfg.nhead,
     num_layers=cfg.num_layers,
     dropout=cfg.dropout,
+    terrain_dim=terrain_dim,
   ).to(device)
   scheduler = DDPMScheduler(
     num_timesteps=cfg.num_timesteps,
   ).to(device)
-  print(f"Denoiser: {count_parameters(model):,} params")
+  if terrain_dim:
+    print(f"Denoiser (terrain-conditioned): {count_parameters(model):,} params")
+  else:
+    print(f"Denoiser: {count_parameters(model):,} params")
 
   optimizer = torch.optim.AdamW(
     model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
@@ -161,8 +205,15 @@ def pretrain(cfg: PretrainCfg) -> Path:
     n_batches = 0
 
     for batch in train_loader:
-      x_0 = batch.to(device, non_blocking=pin_memory)
-      loss = _diffusion_loss(model, scheduler, x_0, cfg.num_noise_samples)
+      if is_conditional:
+        x_0, terrain = batch
+        terrain = terrain.to(device, non_blocking=pin_memory)
+      else:
+        x_0 = batch
+        terrain = None
+      x_0 = x_0.to(device, non_blocking=pin_memory)
+
+      loss = _diffusion_loss(model, scheduler, x_0, cfg.num_noise_samples, terrain)
 
       optimizer.zero_grad()
       loss.backward()
@@ -180,7 +231,8 @@ def pretrain(cfg: PretrainCfg) -> Path:
     if epoch % cfg.log_interval == 0:
       eval_model = ema.shadow if ema is not None else model
       val_loss = _validate(
-        eval_model, scheduler, val_loader, device, pin_memory, cfg.num_noise_samples
+        eval_model, scheduler, val_loader, device, pin_memory, cfg.num_noise_samples,
+        has_terrain=is_conditional,
       )
       print(f"Epoch {epoch:4d} | train={avg_loss:.6f} | val={val_loss:.6f}")
       if wandb_run is not None:
@@ -211,17 +263,24 @@ def pretrain(cfg: PretrainCfg) -> Path:
 def _validate(
   model: torch.nn.Module | DiffusionDenoiser,
   scheduler: DDPMScheduler,
-  val_loader: DataLoader[torch.Tensor],
+  val_loader: DataLoader,
   device: torch.device,
   pin_memory: bool,
   num_noise_samples: int,
+  has_terrain: bool = False,
 ) -> float:
   model.eval()
   total = torch.zeros((), device=device)
   n = 0
   for batch in val_loader:
-    x_0 = batch.to(device, non_blocking=pin_memory)
-    total += _diffusion_loss(model, scheduler, x_0, num_noise_samples)
+    if has_terrain:
+      x_0, terrain = batch
+      terrain = terrain.to(device, non_blocking=pin_memory)
+    else:
+      x_0 = batch
+      terrain = None
+    x_0 = x_0.to(device, non_blocking=pin_memory)
+    total += _diffusion_loss(model, scheduler, x_0, num_noise_samples, terrain)
     n += 1
   return (total / max(n, 1)).item()
 

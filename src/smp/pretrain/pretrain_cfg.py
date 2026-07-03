@@ -15,6 +15,8 @@ class PretrainCfg:
   data_dir: str = "datasets/npz"
   norm_stats_file: str = "datasets/norm_stats.npz"
   """Path to q01/q99 quantile stats from compute_norm_stats.py."""
+  terrain_norm_stats_file: str = ""
+  """Path to terrain q01/q99 quantile stats (conditional training only)."""
   train_split: float = 0.9
 
   # Model. ``d_model = nhead · head_dim`` is the DiT inner dim; FF inner

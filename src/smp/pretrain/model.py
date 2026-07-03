@@ -40,8 +40,35 @@ class _TimestepEmbedding(nn.Module):
     return self.linear_2(self.act(self.linear_1(x)))
 
 
+class _TerrainEncoder(nn.Module):
+  """Encode windowed height-map into a conditioning embedding.
+
+  Per-frame encoding → temporal pool → embed_dim projection.
+  Input ``(B, W, T_dim)`` → output ``(B, embed_dim)``.
+  """
+
+  def __init__(self, terrain_per_frame_dim: int, window_size: int, embed_dim: int) -> None:
+    super().__init__()
+    self.window_size = window_size
+    self.per_frame = nn.Sequential(
+      nn.Linear(terrain_per_frame_dim, embed_dim // 2),
+      nn.SiLU(),
+    )
+    self.proj = nn.Linear(window_size * (embed_dim // 2), embed_dim)
+
+  def forward(self, terrain: torch.Tensor) -> torch.Tensor:
+    B, W, T_dim = terrain.shape
+    h = self.per_frame(terrain)  # (B, W, D//2)
+    return self.proj(h.reshape(B, W * h.shape[-1]))  # (B, D)
+
+
 class _AdaLayerNormSingle(nn.Module):
-  """PixArt-α adaLN-single: produce (B, 1, 6·D) timestep modulation."""
+  """PixArt-α adaLN-single: produce (B, 1, 6·D) timestep + terrain modulation.
+
+  If ``terrain_emb`` is passed, it is added to the time embedding before the
+  final modulation projection so terrain context scales and shifts each
+  DiTBlock the same way the timestep does.
+  """
 
   def __init__(self, embedding_dim: int) -> None:
     super().__init__()
@@ -50,8 +77,11 @@ class _AdaLayerNormSingle(nn.Module):
     self.silu = nn.SiLU()
     self.linear = nn.Linear(embedding_dim, 6 * embedding_dim, bias=True)
 
-  def forward(self, t: torch.Tensor) -> torch.Tensor:
-    t_emb = self.timestep_embedder(self.time_proj(t)).unsqueeze(1)
+  def forward(self, t: torch.Tensor, terrain_emb: torch.Tensor | None = None) -> torch.Tensor:
+    t_emb = self.timestep_embedder(self.time_proj(t))  # (B, D)
+    if terrain_emb is not None:
+      t_emb = t_emb + terrain_emb
+    t_emb = t_emb.unsqueeze(1)  # (B, 1, D)
     return self.linear(self.silu(t_emb))
 
 
@@ -157,16 +187,17 @@ class _DiTBlock(nn.Module):
 
 
 class DiffusionDenoiser(nn.Module):
-  """ε-prediction DiT for motion windows.
+  """ε-prediction DiT for motion windows (optionally terrain-conditioned).
 
   Pipeline: 1×1 Conv1d (channel mix, residual) → linear-in → adaLN-single
-  timestep → additive sinusoidal positional encoding → ``num_layers`` DiT
-  blocks → linear-out → 1×1 Conv1d (residual).
+  timestep (+ optional terrain) → additive sinusoidal positional encoding →
+  ``num_layers`` DiT blocks → linear-out → 1×1 Conv1d (residual).
 
   ``d_model`` is the DiT inner dim; ``head_dim`` defaults to ``d_model //
   nhead``.  FF inner dim is fixed at 4·d_model.
 
-  Input:  ``x_t (B, W, feature_dim)``, ``t (B,)`` long timesteps
+  Input:  ``x_t (B, W, feature_dim)``, ``t (B,)`` long timesteps,
+          ``terrain (B, W, terrain_dim)`` optional
   Output: predicted noise ``(B, W, feature_dim)``
   """
 
@@ -179,6 +210,7 @@ class DiffusionDenoiser(nn.Module):
     num_layers: int = 2,
     dropout: float = 0.0,
     head_dim: int | None = None,
+    terrain_dim: int | None = None,
   ) -> None:
     super().__init__()
     self.feature_dim = feature_dim
@@ -204,6 +236,12 @@ class DiffusionDenoiser(nn.Module):
 
     self.preprocess_conv = nn.Conv1d(feature_dim, feature_dim, 1, bias=False)
     self.proj_in = nn.Linear(feature_dim, self.inner_dim, bias=False)
+
+    if terrain_dim is not None:
+      self.terrain_encoder = _TerrainEncoder(terrain_dim, window_size, self.inner_dim)
+    else:
+      self.terrain_encoder = None
+
     self.adaln_single = _AdaLayerNormSingle(self.inner_dim)
     self.sequence_pos_encoder = _SinusoidalPositionalEmbedding(
       self.inner_dim, max_seq_length=max(window_size, 32)
@@ -222,13 +260,18 @@ class DiffusionDenoiser(nn.Module):
     self.proj_out = nn.Linear(self.inner_dim, feature_dim, bias=False)
     self.postprocess_conv = nn.Conv1d(feature_dim, feature_dim, 1, bias=False)
 
-  def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+  def forward(self, x_t: torch.Tensor, t: torch.Tensor, terrain: torch.Tensor | None = None) -> torch.Tensor:
     h = x_t.transpose(1, 2)
     h = self.preprocess_conv(h) + h
     h = h.transpose(1, 2)
 
     h = self.proj_in(h)
-    time_hidden_states = self.adaln_single(t)
+
+    terrain_emb = None
+    if terrain is not None and self.terrain_encoder is not None:
+      terrain_emb = self.terrain_encoder(terrain)
+
+    time_hidden_states = self.adaln_single(t, terrain_emb)
     h = self.sequence_pos_encoder(h)
 
     for block in self.blocks:
