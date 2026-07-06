@@ -34,6 +34,15 @@ from smp.utils import detect_device
 GRID_X = 17
 GRID_Y = 11
 
+def _load_grid_xy(data_dir: str) -> tuple[np.ndarray, np.ndarray]:
+  """Load grid_x, grid_y from the first NPZ file and build local (x,y) offsets."""
+  npz_files = sorted(Path(data_dir).glob("*.npz"))
+  with np.load(npz_files[0], allow_pickle=False) as d:
+    gx = d["grid_x"].astype(np.float32)
+    gy = d["grid_y"].astype(np.float32)
+  gxv, gyv = np.meshgrid(gx, gy, indexing="ij")
+  return np.stack([gxv.ravel(), gyv.ravel()], axis=-1)  # (187, 2)
+
 
 @dataclass
 class Cfg:
@@ -170,9 +179,12 @@ def main(cfg: Cfg) -> None:
   print(f"  feature_dim={feature_dim}  window_size={window_size}  "
         f"num_timesteps={scheduler.num_timesteps}  terrain_dim={ckpt['cfg'].get('terrain_dim')}")
 
-  # Load all terrain windows for sampling
+  # Load all terrain windows + grid geometry
   all_terrains = _load_terrain_samples(cfg.data_dir, device)
+  local_xy = _load_grid_xy(cfg.data_dir)  # (187, 2) local-frame grid offsets
   print(f"Loaded {all_terrains.shape[0]} terrain windows from {cfg.data_dir}")
+  print(f"Grid: {local_xy[:, 0].max() - local_xy[:, 0].min():.1f}m x "
+        f"{local_xy[:, 1].max() - local_xy[:, 1].min():.1f}m")
 
   sim_device = device_str
   sim, scene = _setup_g1_sim(sim_device)
@@ -266,14 +278,21 @@ def main(cfg: Cfg) -> None:
     )
     ee_points.points = ee_pos[frame]
 
-    # Update height map display for the current frame
-    hm = terrain_raw[0, frame].numpy().reshape(GRID_X, GRID_Y)
-    xs = np.linspace(-0.8, 0.8, GRID_X)
-    ys = np.linspace(-0.5, 0.5, GRID_Y)
-    xv, yv = np.meshgrid(xs, ys, indexing="ij")
-    pts = np.stack([xv.ravel(), yv.ravel(), hm.ravel()], axis=-1)
-    # Shift to world frame (roughly at the robot's position)
-    pts[:, :2] += p_pos[frame, :2]
+    # Height map: rotate by pelvis yaw + offset to pelvis xy + make z relative
+    hm = terrain_raw[0, frame].numpy()                     # (187,)
+    pq = p_quat[frame]                                      # (4,) wxyz
+    w, x, y, z = pq
+    yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+    world_xy = local_xy.copy()
+    world_xy_rot = np.empty_like(world_xy)
+    world_xy_rot[:, 0] = world_xy[:, 0] * cos_y - world_xy[:, 1] * sin_y
+    world_xy_rot[:, 1] = world_xy[:, 0] * sin_y + world_xy[:, 1] * cos_y
+    world_xy_rot[:, 0] += p_pos[frame, 0]
+    world_xy_rot[:, 1] += p_pos[frame, 1]
+    # Terrain heights relative to their mean, placed at ~foot level
+    hm_rel = hm - hm.mean() + (p_pos[frame, 2] - 0.8)
+    pts = np.stack([world_xy_rot[:, 0], world_xy_rot[:, 1], hm_rel], axis=-1)
     hm_points_handle.points = pts.astype(np.float32)
 
     viser_scene.refresh_visualization()

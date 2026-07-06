@@ -18,18 +18,38 @@ from smp.pretrain.model import DiffusionDenoiser
 from smp.pretrain.scheduler import DDPMScheduler
 
 
+def _quantile_normalize(
+  x: torch.Tensor, q_low: torch.Tensor, q_high: torch.Tensor
+) -> torch.Tensor:
+  return 2.0 * (x - q_low) / (q_high - q_low + 1e-8) - 1.0
+
+
 def load_denoiser(
   ckpt_path: str,
   device: torch.device | str,
-) -> tuple[DiffusionDenoiser, DDPMScheduler, torch.Tensor, torch.Tensor, int, int]:
+  terrain_dim: int | None = None,
+) -> tuple[
+  DiffusionDenoiser,
+  DDPMScheduler,
+  torch.Tensor,
+  torch.Tensor,
+  int,
+  int,
+  int | None,
+  torch.Tensor | None,
+  torch.Tensor | None,
+]:
   """Load a frozen pretrained denoiser checkpoint → ``(model, scheduler, q_low,
-  q_high, feature_dim, window_size)``."""
+  q_high, feature_dim, window_size, terrain_dim, t_q_low, t_q_high)``.
+  ``t_q_low``/``t_q_high`` are None for unconditional checkpoints."""
   device = torch.device(device)
 
   ckpt: dict[str, Any] = torch.load(ckpt_path, map_location=device, weights_only=False)
   cfg = ckpt["cfg"]
   feature_dim = int(cfg["feature_dim"])
   window_size = int(cfg["window_size"])
+
+  _td = terrain_dim or cfg.get("terrain_dim")
 
   model = DiffusionDenoiser(
     feature_dim=feature_dim,
@@ -38,6 +58,7 @@ def load_denoiser(
     nhead=int(cfg.get("nhead", 8)),
     num_layers=int(cfg.get("num_layers", 2)),
     dropout=float(cfg.get("dropout", 0.0)),
+    terrain_dim=_td,
   ).to(device)
   state = ckpt.get("model_ema") or ckpt["model"]
   model.load_state_dict(state)
@@ -51,7 +72,14 @@ def load_denoiser(
   q_low = torch.from_numpy(np.asarray(ckpt["q_low"], dtype=np.float32)).to(device)
   q_high = torch.from_numpy(np.asarray(ckpt["q_high"], dtype=np.float32)).to(device)
 
-  return model, scheduler, q_low, q_high, feature_dim, window_size
+  t_q_low = ckpt.get("t_q_low")
+  t_q_high = ckpt.get("t_q_high")
+  if t_q_low is not None:
+    t_q_low = torch.from_numpy(np.asarray(t_q_low, dtype=np.float32)).to(device)
+  if t_q_high is not None:
+    t_q_high = torch.from_numpy(np.asarray(t_q_high, dtype=np.float32)).to(device)
+
+  return model, scheduler, q_low, q_high, feature_dim, window_size, _td, t_q_low, t_q_high
 
 
 class DiffNormalizer:
@@ -107,12 +135,14 @@ class MotionFeatureBuffer:
     num_joints: int,
     num_ee: int,
     device: torch.device | str,
+    terrain_dim: int | None = None,
   ) -> None:
     self.num_envs = num_envs
     self.window_size = window_size
     self.num_joints = num_joints
     self.num_ee = num_ee
     self.device = torch.device(device)
+    self.terrain_dim = terrain_dim
 
     self.root_pos_w = torch.zeros(num_envs, window_size, 3, device=self.device)
     self.root_quat_w = torch.zeros(num_envs, window_size, 4, device=self.device)
@@ -122,6 +152,11 @@ class MotionFeatureBuffer:
     self.ee_pos_w = torch.zeros(num_envs, window_size, num_ee, 3, device=self.device)
     self.joint_pos = torch.zeros(num_envs, window_size, num_joints, device=self.device)
     self.joint_vel = torch.zeros(num_envs, window_size, num_joints, device=self.device)
+
+    if terrain_dim is not None:
+      self.terrain = torch.zeros(num_envs, window_size, terrain_dim, device=self.device)
+    else:
+      self.terrain = None
 
   def reset(
     self,
@@ -133,6 +168,7 @@ class MotionFeatureBuffer:
     ee_pos_w: torch.Tensor,
     joint_pos: torch.Tensor,
     joint_vel: torch.Tensor,
+    terrain: torch.Tensor | None = None,
   ) -> None:
     """Fill all W slots of ``env_ids`` with a pre-sampled trajectory."""
     if env_ids.numel() == 0:
@@ -144,6 +180,8 @@ class MotionFeatureBuffer:
     self.ee_pos_w[env_ids] = ee_pos_w
     self.joint_pos[env_ids] = joint_pos
     self.joint_vel[env_ids] = joint_vel
+    if terrain is not None and self.terrain is not None:
+      self.terrain[env_ids] = terrain
 
   def update(
     self,
@@ -154,6 +192,7 @@ class MotionFeatureBuffer:
     ee_pos_w: torch.Tensor,
     joint_pos: torch.Tensor,
     joint_vel: torch.Tensor,
+    terrain: torch.Tensor | None = None,
   ) -> None:
     """Shift left by one and append the new frame at index W-1."""
     self.root_pos_w = torch.roll(self.root_pos_w, shifts=-1, dims=1)
@@ -170,6 +209,14 @@ class MotionFeatureBuffer:
     self.ee_pos_w[:, -1] = ee_pos_w
     self.joint_pos[:, -1] = joint_pos
     self.joint_vel[:, -1] = joint_vel
+    if terrain is not None and self.terrain is not None:
+      self.terrain = torch.roll(self.terrain, shifts=-1, dims=1)
+      self.terrain[:, -1] = terrain
+
+  def get_terrain(self) -> torch.Tensor | None:
+    """Return the current terrain window ``(num_envs, window_size, terrain_dim)``,
+    or None if terrain conditioning is disabled."""
+    return self.terrain
 
   def compute_features(self) -> torch.Tensor:
     """Return features ``(num_envs, W, 3+6+J+E*3+3+3)``, all anchored to the LAST

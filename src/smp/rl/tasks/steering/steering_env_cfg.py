@@ -64,12 +64,7 @@ def g1_steering_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   )
 
   # --- Terminations --------------------------------------------------------
-  cfg.terminations["base_too_low"] = TerminationTermCfg(
-    func=mdp.root_height_below_minimum,
-    params={
-      "minimum_height": 0.3,
-      "asset_cfg": SceneEntityCfg("robot"),
-    },
-  )
+  # ``root_height`` (root_height_below_env_origin_minimum) is already in the
+  # base config with minimum_height=0.5, matching parkour.
 
   return cfg
