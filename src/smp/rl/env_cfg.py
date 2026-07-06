@@ -41,6 +41,7 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   ``init_smp_state`` below; override it from the task config)."""
 
   # --- Observations --------------------------------------------------------
+  # policy网络根线速度角速度重力投影关节角度关节速度和上一帧动作，并且都注入较大的噪声
   actor_terms = {
     "base_lin_vel": ObservationTermCfg(
       func=mdp.builtin_sensor,
@@ -70,7 +71,7 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   critic_terms = {
     **actor_terms,
   }
-
+  # critic网络则不加入噪声
   observations = {
     "actor": ObservationGroupCfg(
       terms=actor_terms,

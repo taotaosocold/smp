@@ -62,6 +62,7 @@ def init_smp_state(
       "params={'ckpt_path': '/path/to/pretrained.pt'})."
     )
     raise RuntimeError(msg)
+  # 加载冻结去噪器
   model, scheduler, q_low, q_high, feature_dim, window_size = load_denoiser(
     ckpt_path, env.device
   )
@@ -75,11 +76,13 @@ def init_smp_state(
     window_size,
   )
   robot = env.scene["robot"]
+  # 从机器人模型中找到这些身体的索引，用于后续从仿真状态中提取末端位置，构建运动特征
   env._smp_ee_indexes = torch.tensor(  # type: ignore[attr-defined]
     robot.find_bodies(list(EE_BODY_NAMES), preserve_order=True)[0],
     dtype=torch.long,
     device=env.device,
   )
+  # 每个并行环境维护一个滑动窗口，存储最近 window_size 帧的关节角度和末端位置历史
   env._smp_buffer = MotionFeatureBuffer(  # type: ignore[attr-defined]
     num_envs=env.num_envs,
     window_size=window_size,
@@ -87,17 +90,20 @@ def init_smp_state(
     num_ee=NUM_EE,
     device=env.device,
   )
+  # 创建扩散归一化器
   env._smp_normalizer = DiffNormalizer(scheduler.num_timesteps, env.device)  # type: ignore[attr-defined]
 
   if gsi_buffer_size <= 0:
     msg = f"gsi_buffer_size must be positive, got {gsi_buffer_size}."
     raise ValueError(msg)
   pool_chunks: list[torch.Tensor] = []
+  # 预生成 GSI 池（DDPM 采样）
   for start in range(0, gsi_buffer_size, gsi_batch_size):
     bsz = min(gsi_batch_size, gsi_buffer_size - start)
+    # 从纯噪声生成初始化的状态值，然后写入pool中
     pool_chunks.append(_ddpm_sample(env, bsz))
   env._smp_gsi_pool = torch.cat(pool_chunks, dim=0)  # type: ignore[attr-defined]
-
+  # 编译预热（Warm-up）
   if compile_model and env.num_envs != gsi_batch_size:
     # Warm the reward-path shape so its Inductor compile happens here.
     with torch.no_grad():
@@ -117,6 +123,7 @@ def _prime_sim_and_buffer(
   buffer.  The buffer is env-origin-RELATIVE (placement-invariant features) while
   the sim write adds each env's origin so robots spread across the grid.
   ``joint_vel`` is finite-differenced from ``joint_pos`` (not in the window)."""
+  # 首先将window按特征维度切分为根位置（局部）、根旋转（6D）、关节位置、末端位置（局部）、根线速度、根角速度
   n, W, _ = window.shape
   E = NUM_EE
   parts = slice_features(window)
@@ -128,20 +135,25 @@ def _prime_sim_and_buffer(
   root_ang_vel_local = parts["root_ang_vel"]
 
   control_dt = float(env.cfg.sim.mujoco.timestep) * float(env.cfg.decimation)
+  # 如果窗口大于1，则用有限差分从关节位置计算关节速度
   if W > 1:
     joint_vel = torch.zeros_like(joint_pos)
     joint_vel[:, :-1] = (joint_pos[:, 1:] - joint_pos[:, :-1]) / control_dt
     joint_vel[:, -1] = joint_vel[:, -2]
+  # 否则置零
   else:
     joint_vel = torch.zeros_like(joint_pos)
-
+  # 获取各环境的初始的根数据
   robot = env.scene["robot"]
   default_root = robot.data.default_root_state[env_ids].clone()
+  # 获得初始的默认根位置
   default_pos = default_root[:, 0:3]
+  # 获得初始的默认根朝向
   default_quat = default_root[:, 3:7]
+  # 从默认四元数中获得默认偏航四元数
   yaw_T = yaw_quat(default_quat)
   yaw_T_W = yaw_T[:, None, :].expand(n, W, 4).reshape(-1, 4)
-
+  # 局部 xy 旋转后加上环境的默认原点 default_pos，高度直接使用局部 z 值（保持相对地形高度）
   local_xy = root_pos_local.clone()
   local_xy[..., 2] = 0.0
   world_offset_xy = quat_apply(yaw_T_W, local_xy.reshape(-1, 3)).reshape(n, W, 3)
@@ -149,10 +161,10 @@ def _prime_sim_and_buffer(
   pelvis_pos_w[..., 0] += default_pos[:, None, 0]
   pelvis_pos_w[..., 1] += default_pos[:, None, 1]
   pelvis_pos_w[..., 2] = root_pos_local[..., 2]
-
+  # 局部的 6D 旋转转为四元数后，再乘上偏航四元数得到世界朝向
   root_rot_local_quat = rot6d_to_quat(root_rot_6d.reshape(-1, 6)).reshape(n, W, 4)
   pelvis_quat_w = quat_mul(yaw_T_W, root_rot_local_quat.reshape(-1, 4)).reshape(n, W, 4)
-
+  # 同样用偏航旋转到世界系
   lin_vel_w = quat_apply(yaw_T_W, root_lin_vel_local.reshape(-1, 3)).reshape(n, W, 3)
   ang_vel_w = quat_apply(yaw_T_W, root_ang_vel_local.reshape(-1, 3)).reshape(n, W, 3)
 
@@ -171,6 +183,7 @@ def _prime_sim_and_buffer(
     ],
     dim=-1,
   )
+  # 直接写入仿真器，将根位置朝向速度和关节转角和关节速度
   robot.write_root_state_to_sim(last_root_state, env_ids=env_ids)
   robot.write_joint_state_to_sim(joint_pos[:, -1], joint_vel[:, -1], env_ids=env_ids)
 
@@ -218,7 +231,7 @@ def gsi_refresh(
   if num_samples > pool_size:
     msg = f"num_samples ({num_samples}) cannot exceed pool size ({pool_size})"
     raise ValueError(msg)
-
+  # 从纯噪声生成初始化的状态值，然后写入pool中
   new_windows = _ddpm_sample(env, num_samples)
   head = int(getattr(env, "_smp_gsi_head", 0))
   end = head + num_samples
@@ -230,7 +243,7 @@ def gsi_refresh(
     pool[: end - pool_size] = new_windows[first:]
   env._smp_gsi_head = end % pool_size  # type: ignore[attr-defined]
 
-
+# 重置时从GSI池注入引导
 @torch.no_grad()
 def gsi_reset(env: ManagerBasedRlEnv, env_ids: torch.Tensor | None = None) -> None:
   """Generative State Initialization: sample ``n`` windows from the GSI pool and
@@ -241,7 +254,7 @@ def gsi_reset(env: ManagerBasedRlEnv, env_ids: torch.Tensor | None = None) -> No
   n = int(env_ids.numel())
   if n == 0:
     return
-
+  # 从pool中随机采样初始化状态的值，然后对其进行处理后在写入仿真器中
   pool: torch.Tensor = env._smp_gsi_pool  # type: ignore[attr-defined]
   idx = torch.randint(0, pool.shape[0], (n,), device=env.device)
   window = pool[idx]

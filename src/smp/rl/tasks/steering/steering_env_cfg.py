@@ -20,6 +20,7 @@ from smp.rl.tasks.steering import mdp
 
 def g1_steering_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   """Build the G1 steering env cfg with SMP guidance."""
+  # 直接先获得g1_smp_env_cfg实例对象，然后在这基础上去修改或添加观测、终止、奖励等等
   cfg = g1_smp_env_cfg(play=play)
 
   # --- Commands ------------------------------------------------------------
