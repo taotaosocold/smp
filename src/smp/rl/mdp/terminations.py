@@ -37,15 +37,27 @@ def terrain_out_of_bounds(
     return torch.logical_or(x_out, y_out)
 
 
-def root_height_below_env_origin_minimum(
+def root_height_below_terrain_minimum(
     env: ManagerBasedRlEnv,
     minimum_height: float,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Terminate when the root height above the env-origin terrain is too low."""
+    """Terminate when root height above the terrain directly below the robot is too low.
+
+    Uses the terrain scan sensor (center of grid = directly below pelvis) when
+    available, falling back to env-origin z for flat-terrain setups.
+    """
     asset = env.scene[asset_cfg.name]
-    terrain_base = torch.clamp(env.scene.env_origins[:, 2], max=0.0)
-    return asset.data.root_link_pos_w[:, 2] - terrain_base < minimum_height
+    root_z = asset.data.root_link_pos_w[:, 2]
+
+    terrain_sensor = env.scene.sensors.get("terrain_scan")
+    if terrain_sensor is not None:
+        # 17×11 grid center index 93 = terrain directly below pelvis
+        terrain_z = terrain_sensor.data.hit_pos_w[:, 93, 2]
+    else:
+        terrain_z = torch.clamp(env.scene.env_origins[:, 2], max=0.0)
+
+    return root_z - terrain_z < minimum_height
 
 
 def base_contact(

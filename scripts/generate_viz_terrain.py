@@ -33,6 +33,7 @@ from smp.utils import detect_device
 
 GRID_X = 17
 GRID_Y = 11
+CENTER_IDX = GRID_X // 2 * GRID_Y + GRID_Y // 2  # 93 = terrain directly below pelvis
 
 def _load_grid_xy(data_dir: str) -> tuple[np.ndarray, np.ndarray]:
   """Load grid_x, grid_y from the first NPZ file and build local (x,y) offsets."""
@@ -205,6 +206,10 @@ def main(cfg: Cfg) -> None:
     p_pos, p_quat, p_joint = window_to_pelvis_trajectory(
       pred_denorm, anchor_pelvis_pos, anchor_pelvis_quat,
     )
+    # root_pos[2] is terrain-relative → convert to world z.
+    terrain_z = terrain_raw[0, :, CENTER_IDX].to(p_pos.device)  # (W,)
+    p_pos = p_pos.clone()
+    p_pos[:, 2] += terrain_z
     ee_pos = window_to_ee_trajectories(pred_denorm, p_pos, p_quat)
     return (
       p_pos.cpu().numpy(),

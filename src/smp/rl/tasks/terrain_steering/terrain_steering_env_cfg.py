@@ -9,8 +9,8 @@ from __future__ import annotations
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
-from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.managers.termination_manager import TerminationTermCfg
+from mjlab.sensor import GridPatternCfg, RayCastSensorCfg
+from mjlab.sensor.builtin_sensor import ObjRef
 
 from smp.rl.env_cfg import g1_smp_env_cfg
 from smp.rl.rewards import task_smp_product
@@ -19,11 +19,20 @@ from smp.rl.tasks.steering import mdp
 
 def g1_terrain_steering_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   """Build the G1 steering env cfg with terrain-conditioned SMP guidance."""
-  cfg = g1_smp_env_cfg(
-    play=play,
-    terrain_type="generator",
-    terrain_conditioned=True,
-    terrain_dim=187,
+  cfg = g1_smp_env_cfg(play=play)
+
+  # --- Scene: add terrain height scanner on torso_link (same 17×11 grid as
+  # pretraining) so the denoiser sees terrain via cross-attention.
+  cfg.scene.sensors = cfg.scene.sensors + (
+    RayCastSensorCfg(
+      name="terrain_scan",
+      frame=ObjRef(type="body", name="torso_link", entity="robot"),
+      pattern=GridPatternCfg(size=(1.6, 1.0), resolution=0.1),
+      ray_alignment="yaw",
+      max_distance=5.0,
+      exclude_parent_body=True,
+      include_geom_groups=(0,),
+    ),
   )
 
   # --- Commands ------------------------------------------------------------
@@ -63,11 +72,11 @@ def g1_terrain_steering_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # --- Events --------------------------------------------------------------
   cfg.events["init_smp_state"].params["ckpt_path"] = (
-    "logs/pretrain/lafan_g1_walk_with_terrain/20260706_104243/pretrained.pt"
+    "logs/pretrain/lafan_g1_walk_with_terrain/20260706_162325/pretrained.pt"
   )
 
   # --- Terminations --------------------------------------------------------
-  # ``root_height`` (root_height_below_env_origin_minimum) is already in the
+  # ``root_height`` (root_height_below_terrain_minimum) is already in the
   # base config with minimum_height=0.5, matching parkour.
 
   return cfg

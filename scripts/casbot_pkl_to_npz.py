@@ -7,7 +7,7 @@ Each output NPZ contains a ``windows`` array of shape ``(N, window_size, 55)``
 with the per-frame layout:
 
   root_pos        (3)              xy in last-frame heading-inv frame
-                                    relative to last root; z in world
+                                    relative to last root; z terrain-relative
   root_rot        (6)              6D tan-norm of heading_inv(T) ⊗ root_quat[t]
   joint_pos       (num_joints=25)  raw joint angles
   ee_pos          (num_ee*3=15)    end-effectors, per-frame root offset,
@@ -200,7 +200,7 @@ def _compute_windows(
   heading_inv_T_WF = quat_conjugate(yaw_T)[:, None, :].expand(N, W, 4).reshape(-1, 4)
   yaw_T_W = yaw_T[:, None, :].expand(N, W, 4).reshape(-1, 4)
 
-  # root_pos: xy in heading-inv frame, z in world.
+  # root_pos: xy in heading-inv frame, z terrain-relative.
   root_offset = win_base_pos - anchor_pos_T[:, None, :]
   root_pos_local = quat_apply_inverse(yaw_T_W, root_offset.reshape(-1, 3)).reshape(
     N, W, 3

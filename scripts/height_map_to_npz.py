@@ -4,6 +4,7 @@ Each input NPZ contains per-frame G1 motion data + height_map (terrain).  This
 script windows both the motion and terrain data, producing output NPZs with:
 
   motion_windows  (N, window_size, 59)   — same 59-dim feature layout as csv_to_npz
+                                          root_pos z is terrain-relative
   terrain         (N, window_size, 187)  — height_map per frame (17×11 grid)
 
 Motion features are anchored to the LAST window frame's yaw-only local frame
@@ -90,6 +91,7 @@ def _compute_windows(
     """Window motion and terrain data.  Returns (motion, terrain) or (None, None).
 
     Motion features anchored to the LAST frame's yaw-only local frame.
+    root_pos z is terrain-relative (height above terrain at pelvis xy).
     Terrain stays in each frame's own local frame.
     """
     T = base_pos.shape[0]
@@ -121,11 +123,15 @@ def _compute_windows(
     heading_inv_T_WF = quat_conjugate(yaw_T)[:, None, :].expand(N, W, 4).reshape(-1, 4)
     yaw_T_W = yaw_T[:, None, :].expand(N, W, 4).reshape(-1, 4)
 
-    # root_pos: xy in heading-invariant frame, z in world
+    # root_pos: xy in heading-invariant frame, z terrain-relative (height above terrain)
     root_offset = win_base_pos - anchor_pos_T[:, None, :]  # (N, W, 3)
     root_pos_local = quat_apply_inverse(yaw_T_W, root_offset.reshape(-1, 3)).reshape(N, W, 3)
     root_pos_local = root_pos_local.clone()
-    root_pos_local[..., 2] = win_base_pos[..., 2]
+    # Terrain height at pelvis xy = center of the 17×11 grid (directly below pelvis).
+    # Grid is pelvis-centered, yaw-aligned → center index (8, 5) = 8*11+5 = 93.
+    win_terrain = height_map.index_select(0, flat_idx).reshape(N, W, HEIGHT_MAP_DIM)
+    terrain_z = win_terrain[:, :, GRID_X // 2 * GRID_Y + GRID_Y // 2]  # (N, W)
+    root_pos_local[..., 2] = win_base_pos[..., 2] - terrain_z
 
     # root_rot: heading_inv(T) ⊗ root_quat[t] → 6D tan-norm
     root_rot_local_quat = quat_mul(
@@ -146,9 +152,6 @@ def _compute_windows(
         [root_pos_local, root_rot_6d, win_joint, ee_pos_local, lin_vel_local, ang_vel_local],
         dim=-1,
     )  # (N, W, 59)
-
-    # Window terrain (keep in per-frame local frame, no rotation)
-    win_terrain = height_map.index_select(0, flat_idx).reshape(N, W, HEIGHT_MAP_DIM)
 
     return motion, win_terrain
 

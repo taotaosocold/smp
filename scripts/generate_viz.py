@@ -1,14 +1,12 @@
 """Unconditionally generate a motion window with a trained SMP diffusion model
 and visualize the predicted trajectory in a viser viewer.
 
-Features carry ``root_pos`` (xy heading-inv + world z) and ``root_rot``
-(6D tan-norm, heading-inv relative to the last-frame root), so the
-world-frame pelvis trajectory is reconstructed directly from those two —
-no velocity integration needed.  The last window frame is placed at a
-chosen anchor pose (default: the robot's default standing state) and the
-rest of the window is reconstructed relative to it.  EE positions come
-from the sampled ``ee_pos`` feature lifted into world via the per-frame
-pelvis pose.
+Features carry ``root_pos`` (xy heading-inv + terrain-relative z) and
+``root_rot`` (6D tan-norm, heading-inv relative to the last-frame root).
+The last window frame is placed at a chosen anchor pose (default: the
+robot's default standing state) and the rest of the window is reconstructed
+relative to it.  EE positions come from the sampled ``ee_pos`` feature
+lifted into world via the per-frame pelvis pose.
 """
 
 from __future__ import annotations
