@@ -36,7 +36,12 @@ from mjlab.terrains.config import (
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
-from smp.rl.events import init_smp_state, reset_smp_buffer_flag
+from smp.rl.events import (
+  gsi_refresh,
+  gsi_reset,
+  init_smp_state,
+  reset_smp_buffer_flag,
+)
 from smp.rl.mdp.terminations import (
   base_contact,
   root_height_below_env_origin_minimum,
@@ -49,6 +54,7 @@ def g1_smp_env_cfg(
   terrain_type: str = "plane",
   terrain_conditioned: bool = False,
   terrain_dim: int | None = None,
+  use_gsi: bool = True,
 ) -> ManagerBasedRlEnvCfg:
   """Build the shared G1 + SMP env cfg (denoiser ckpt path set on
   ``init_smp_state`` below; override it from the task config).
@@ -60,6 +66,8 @@ def g1_smp_env_cfg(
       and pass ``terrain_dim`` to the SMP denoiser.
     terrain_dim: Height-map dimension (e.g. 187 for 17×11 grid). Only used
       when ``terrain_conditioned=True``.
+    use_gsi: If True, use Generative State Initialisation (DDPM-sampled
+      poses from pool).  If False, use uniform reset + joint offset.
   """
 
   # --- Observations --------------------------------------------------------
@@ -121,16 +129,20 @@ def g1_smp_env_cfg(
   commands: dict[str, CommandTermCfg] = {}
 
   # --- Events --------------------------------------------------------------
+  init_params: dict = {
+    "ckpt_path": "logs/pretrain/lafan_g1_walk_with_terrain/20260706_104243/pretrained.pt",
+    "compile_model": True,
+    "compile_mode": "max-autotune",
+    "terrain_dim": terrain_dim,
+  }
+  if not use_gsi:
+    init_params["gsi_buffer_size"] = 0
+
   events = {
     "init_smp_state": EventTermCfg(
       func=init_smp_state,
       mode="startup",
-      params={
-        "ckpt_path": "logs/pretrain/lafan_g1_walk_with_terrain/20260706_104243/pretrained.pt",
-        "compile_model": True,
-        "compile_mode": "max-autotune",
-        "terrain_dim": terrain_dim,
-      },
+      params=init_params,
     ),
     "reset_base": EventTermCfg(
       func=mdp.reset_root_state_uniform,
@@ -150,18 +162,6 @@ def g1_smp_env_cfg(
           "yaw": (-0.2, 0.2),
         },
       },
-    ),
-    "reset_joints": EventTermCfg(
-      func=mdp.reset_joints_by_offset,
-      mode="reset",
-      params={
-        "position_range": (-0.15, 0.15),
-        "velocity_range": (0.0, 0.0),
-      },
-    ),
-    "reset_smp_buffer": EventTermCfg(
-      func=reset_smp_buffer_flag,
-      mode="reset",
     ),
     "push_robot": EventTermCfg(
       func=mdp.push_by_setting_velocity,
@@ -212,6 +212,30 @@ def g1_smp_env_cfg(
       },
     ),
   }
+
+  if use_gsi:
+    events["gsi_reset"] = EventTermCfg(
+      func=gsi_reset,
+      mode="reset",
+    )
+    events["gsi_refresh"] = EventTermCfg(
+      func=gsi_refresh,
+      mode="step",
+      params={"num_samples": 1024, "step_interval": 2400},
+    )
+  else:
+    events["reset_joints"] = EventTermCfg(
+      func=mdp.reset_joints_by_offset,
+      mode="reset",
+      params={
+        "position_range": (-0.15, 0.15),
+        "velocity_range": (0.0, 0.0),
+      },
+    )
+    events["reset_smp_buffer"] = EventTermCfg(
+      func=reset_smp_buffer_flag,
+      mode="reset",
+    )
 
   # --- Rewards -------------------------------------------------------------
   rewards: dict[str, RewardTermCfg] = {}

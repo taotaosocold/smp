@@ -1,9 +1,9 @@
-"""Convert SMP feature windows back to robot world-frame states for viz + GSI.
+"""Convert SMP feature windows back to robot states for viz + GSI.
 
 Per-frame motion features: root pose (pos + 6D rot), joint angles,
 end-effector positions, and root velocities.  All spatial quantities are
 expressed in the LAST window frame's yaw-only local frame (origin at
-pelvis_T, heading = yaw_T).
+pelvis_T, heading = yaw_T).  root_pos z is terrain-relative.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def slice_features(frame: torch.Tensor) -> dict[str, torch.Tensor]:
   """Slice a feature vector into named components.
 
   Layout (matches ``scripts/csv_to_npz.py::_compute_windows``):
-    [0:3]                   root_pos       xy in last-frame heading-inv, z world
+    [0:3]                   root_pos       xy in last-frame heading-inv, z terrain-relative
     [3:9]                   root_rot       6D tan-norm of heading_inv(T) ⊗ root_quat[t]
     [9:9+J]                 joint_pos      raw joint angles (J = 29 for G1)
     [9+J:9+J+E*3]           ee_pos         per-frame root offset, last-frame
@@ -95,11 +95,10 @@ def window_to_pelvis_trajectory(
   anchor_pelvis_pos_w: torch.Tensor,
   anchor_pelvis_quat_w: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  """Reconstruct world-frame pelvis pose + joint pos for each frame in a window.
+  """Reconstruct pelvis pose + joint pos for each frame in a window.
 
-  Features carry ``root_pos`` (xy heading-inv + world z) and ``root_rot``
-  (heading-inv relative), so the full pelvis trajectory is reconstructable
-  directly without velocity integration.
+  ``root_pos`` z is terrain-relative (height above terrain).  Callers must
+  add terrain height to convert back to world z when needed.
 
   Args:
     window: (W, F) denormalized feature window.
@@ -107,7 +106,7 @@ def window_to_pelvis_trajectory(
     anchor_pelvis_quat_w: (4,) world quaternion (wxyz) at frame T.
 
   Returns:
-    pelvis_pos_w:  (W, 3)
+    pelvis_pos_w:  (W, 3) — z is terrain-relative
     pelvis_quat_w: (W, 4) wxyz
     joint_pos:     (W, J)
   """

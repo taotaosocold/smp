@@ -39,6 +39,13 @@ def _update_buffer_from_sim(env: ManagerBasedRlEnv) -> None:
   if terrain_sensor is not None and buffer.terrain is not None:
     terrain = terrain_sensor.data.hit_pos_w[..., 2]  # (num_envs, 187)
 
+  # Make root_pos z terrain-relative (height above terrain at pelvis xy).
+  # Grid is 17×11, pelvis-centered → center index (8, 5) = 93 is directly below pelvis.
+  if terrain is not None:
+    terrain_height = terrain[:, 93]  # (num_envs,)
+    root_pos = root_pos.clone()
+    root_pos[..., 2] = robot.data.root_link_pos_w[..., 2] - terrain_height
+
   if getattr(env, "_smp_buffer_needs_init", False):
     # No GSI reset — fill all W slots with the current sim state so the
     # first SMP reward computation sees a consistent (repeated) window.

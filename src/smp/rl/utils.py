@@ -126,7 +126,7 @@ class MotionFeatureBuffer:
          root_lin_vel(3), root_ang_vel(3)]``
 
   ``joint_vel`` is stored for symmetry but excluded from the output.  Positions
-  use the caller's frame (SMP RL feeds env-origin-relative)."""
+  use the caller's frame (SMP RL feeds env-origin-relative xy + terrain-relative z)."""
 
   def __init__(
     self,
@@ -220,7 +220,8 @@ class MotionFeatureBuffer:
 
   def compute_features(self) -> torch.Tensor:
     """Return features ``(num_envs, W, 3+6+J+E*3+3+3)``, all anchored to the LAST
-    frame's yaw-only local frame (layout in the class docstring)."""
+    frame's yaw-only local frame.  root_pos z is terrain-relative (height above
+    terrain at pelvis xy)."""
     N = self.num_envs
     W = self.window_size
     E = self.num_ee
@@ -233,6 +234,7 @@ class MotionFeatureBuffer:
     yaw_T_W = yaw_T[:, None, :].expand(N, W, 4).reshape(-1, 4)
 
     root_offset = self.root_pos_w - anchor_pos_T[:, None, :]
+    # xy heading-inv relative to anchor, z stays terrain-relative (height above terrain).
     root_pos_local = quat_apply_inverse(yaw_T_W, root_offset.reshape(-1, 3)).reshape(
       N, W, 3
     )
