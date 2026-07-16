@@ -102,6 +102,22 @@ def task_smp_product(
 ) -> torch.Tensor:
   """``(Σ wᵢ · taskᵢ(env)) · r_smp`` — multiplicative SMP gating; ``task_terms`` is
   a tuple of ``(func, weight, kwargs)``.  Calls ``smp_guidance_reward`` once (the
-  sole SMP-buffer update), so it must be the task's only SMP reward term."""
+  sole SMP-buffer update), so it must be the task's only SMP reward term.
+
+  Stashes the un-gated task sum and SMP gate in the reward manager's episode
+  sums so they appear as ``Episode_Reward/smp_task`` and
+  ``Episode_Reward/smp_gate`` in logs."""
   task = sum(w * func(env, **kw) for func, w, kw in task_terms)
-  return task * smp_guidance_reward(env, fixed_timesteps=fixed_timesteps, ws=ws)
+  gate = smp_guidance_reward(env, fixed_timesteps=fixed_timesteps, ws=ws)
+
+  # Record the two components so they show up in Episode_Reward/ logs.
+  env._smp_dbg_task = task  # type: ignore[attr-defined]
+  env._smp_dbg_gate = gate  # type: ignore[attr-defined]
+  rm = env.reward_manager
+  dt = env.step_dt
+  for name, val in (("smp_task", task), ("smp_gate", gate)):
+    if name not in rm._episode_sums:
+      rm._episode_sums[name] = torch.zeros(env.num_envs, device=env.device)
+    rm._episode_sums[name] += val.detach() * dt
+
+  return task * gate

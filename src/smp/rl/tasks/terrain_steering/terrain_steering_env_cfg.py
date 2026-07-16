@@ -76,7 +76,7 @@ def g1_terrain_steering_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
           0.5,
           {"command_name": "steering", "vel_err_scale": 1.0},
         ),
-        (mdp.steering_face_direction, 0.5, {"command_name": "steering"}),
+        (mdp.steering_face_direction, 0.0, {"command_name": "steering"}),
       ),
     },
   )
