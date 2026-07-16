@@ -295,10 +295,12 @@ class DiffusionDenoiser(nn.Module):
       t_emb = self.terrain_proj(terrain)  # (B, W, inner_dim)
       t_emb = self.terrain_pos_encoder(t_emb)
 
-    # --- DiT blocks (cross-attention) -------------------------------------
+    # --- DiT blocks (cross-attn only in the last block so early layers
+    # preserve noise-driven diversity; the last layer injects terrain) ----
     time_hidden_states = self.adaln_single(t)
-    for block in self.blocks:
-      h = block(h, t_emb, time_hidden_states)
+    for i, block in enumerate(self.blocks):
+      t_block = t_emb if i == len(self.blocks) - 1 else None
+      h = block(h, t_block, time_hidden_states)
 
     # --- Output projection ------------------------------------------------
     h = self.proj_out(h)  # (B, W, feature_dim)

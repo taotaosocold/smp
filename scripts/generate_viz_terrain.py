@@ -41,7 +41,7 @@ def _load_grid_xy(data_dir: str) -> tuple[np.ndarray, np.ndarray]:
   with np.load(npz_files[0], allow_pickle=False) as d:
     gx = d["grid_x"].astype(np.float32)
     gy = d["grid_y"].astype(np.float32)
-  gxv, gyv = np.meshgrid(gx, gy, indexing="ij")
+  gxv, gyv = np.meshgrid(gx, gy)
   return np.stack([gxv.ravel(), gyv.ravel()], axis=-1)  # (187, 2)
 
 
@@ -206,10 +206,8 @@ def main(cfg: Cfg) -> None:
     p_pos, p_quat, p_joint = window_to_pelvis_trajectory(
       pred_denorm, anchor_pelvis_pos, anchor_pelvis_quat,
     )
-    # root_pos[2] is terrain-relative → convert to world z.
-    terrain_z = terrain_raw[0, :, CENTER_IDX].to(p_pos.device)  # (W,)
-    p_pos = p_pos.clone()
-    p_pos[:, 2] += terrain_z
+    # root_pos[2] is already absolute pelvis z (terrain is center-subtracted,
+    # so center cell = 0 → root_pos[2] = pelvis_world_z − 0 = pelvis_world_z).
     ee_pos = window_to_ee_trajectories(pred_denorm, p_pos, p_quat)
     return (
       p_pos.cpu().numpy(),
@@ -265,9 +263,10 @@ def main(cfg: Cfg) -> None:
 
   @next_terrain_btn.on_click
   def _(_evt) -> None:
-    terrain_idx["v"] = (terrain_idx["v"] + 1) % all_terrains.shape[0]
-    terrain_display.value = terrain_idx["v"]
-    t_raw = all_terrains[terrain_idx["v"]:terrain_idx["v"] + 1]
+    ridx = int(torch.randint(0, all_terrains.shape[0], (1,)).item())
+    terrain_idx["v"] = ridx
+    terrain_display.value = ridx
+    t_raw = all_terrains[ridx:ridx + 1]
     state["pred"] = run(t_raw)
 
   def render(frame: int) -> None:
@@ -295,9 +294,8 @@ def main(cfg: Cfg) -> None:
     world_xy_rot[:, 1] = world_xy[:, 0] * sin_y + world_xy[:, 1] * cos_y
     world_xy_rot[:, 0] += p_pos[frame, 0]
     world_xy_rot[:, 1] += p_pos[frame, 1]
-    # Terrain heights relative to their mean, placed at ~foot level
-    hm_rel = hm - hm.mean() + (p_pos[frame, 2] - 0.8)
-    pts = np.stack([world_xy_rot[:, 0], world_xy_rot[:, 1], hm_rel], axis=-1)
+    # Terrain heights are center-subtracted (center cell = 0 at ground level).
+    pts = np.stack([world_xy_rot[:, 0], world_xy_rot[:, 1], hm], axis=-1)
     hm_points_handle.points = pts.astype(np.float32)
 
     viser_scene.refresh_visualization()

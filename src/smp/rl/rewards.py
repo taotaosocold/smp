@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from smp.rl.events import _CENTER_IDX
 from smp.rl.utils import DiffNormalizer, MotionFeatureBuffer
 
 if TYPE_CHECKING:
@@ -27,7 +28,8 @@ def _update_buffer_from_sim(env: ManagerBasedRlEnv) -> None:
   terrain: torch.Tensor | None = None
   terrain_sensor = env.scene.sensors.get("terrain_scan")
   if terrain_sensor is not None and buffer.terrain is not None:
-    terrain = terrain_sensor.data.hit_pos_w[..., 2]  # (num_envs, 187)
+    heights_w = terrain_sensor.data.hit_pos_w[..., 2]  # (num_envs, 187) world
+    terrain = heights_w - origins[:, 2:3]  # env-local
 
   buffer.update(
     robot.data.root_link_pos_w - origins,
@@ -64,8 +66,9 @@ def smp_guidance_reward(
   terrain_norm: torch.Tensor | None = None
   raw_terrain = buffer.get_terrain()
   if raw_terrain is not None and t_q_low is not None and t_q_high is not None:
+    terrain_centered = raw_terrain - raw_terrain[:, :, _CENTER_IDX:_CENTER_IDX + 1]
     terrain_norm = (
-      2.0 * (raw_terrain - t_q_low) / (t_q_high - t_q_low + 1e-8) - 1.0
+      2.0 * (terrain_centered - t_q_low) / (t_q_high - t_q_low + 1e-8) - 1.0
     )
 
   total_err = torch.zeros(num_envs, device=device)

@@ -17,6 +17,9 @@ from mjlab.utils.lab_api.math import (
 from smp.pretrain.model import DiffusionDenoiser
 from smp.pretrain.scheduler import DDPMScheduler
 
+# Terrain grid center cell (17×11 grid, center directly below pelvis).
+_CENTER_IDX = 93
+
 
 def load_denoiser(
   ckpt_path: str,
@@ -229,6 +232,8 @@ class MotionFeatureBuffer:
     )
     root_pos_local = root_pos_local.clone()
     root_pos_local[..., 2] = self.root_pos_w[..., 2]
+    if self.terrain is not None:
+      root_pos_local[..., 2] = root_pos_local[..., 2] - self.terrain[:, :, _CENTER_IDX]
 
     # 6D rot is stacked [col0, col2] = [rotated-x-axis, rotated-z-axis].
     root_rot_local_quat = quat_mul(
