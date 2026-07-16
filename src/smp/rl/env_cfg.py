@@ -174,6 +174,7 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   rewards: dict[str, RewardTermCfg] = {}
 
   # --- Sensors -------------------------------------------------------------
+  # 这里自碰撞的配置是匹配robot的pelvis子树下所有body，只检测是否接触然后不读力矩，只要出现接触就会触发重置
   self_collision_cfg = ContactSensorCfg(
     name="self_collision",
     primary=ContactMatch(mode="subtree", pattern="pelvis", entity="robot"),
